@@ -5,6 +5,7 @@ import copy
 from collections import OrderedDict
 
 import numpy as np
+import sigopt
 from scipy import stats
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import RandomizedSearchCV
@@ -296,4 +297,22 @@ class SpearmintOptimizer(Optimizer):
 
 
 class SigOptOptimizer(Optimizer):
-    pass
+    def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
+                 refit=True, expr_name='unnamed', verbose=0, api_token='', n_jobs=1):
+        super(SigOptOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
+                                              cv=cv, refit=refit, expr_name=expr_name, verbose=verbose)
+        self.conn = sigopt.Connection(client_token=api_token)
+        self.n_jobs = n_jobs
+
+    def fit(self, X, y=None):
+        experiment = self.conn.experiments().create(
+            name=self.expr_name,
+            parameters=[
+                dict(name='x', type='double', bounds=dict(min=0.0, max=1.0)),
+                dict(name='y', type='double', bounds=dict(min=0.0, max=1.0)),
+            ],
+        )
+
+    @property
+    def best_estimator_(self):
+        pass
