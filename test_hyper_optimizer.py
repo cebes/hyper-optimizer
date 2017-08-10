@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from hyper_optimizer import Parameter, HyperBaseEstimator, RandomOptimizer
+from hyper_optimizer import Parameter, HyperBaseEstimator, RandomOptimizer, SigOptOptimizer, SpearmintOptimizer
 
 
 class NegatedBranin(HyperBaseEstimator):
@@ -30,6 +30,28 @@ class TestHyperOptimizer(unittest.TestCase):
 
         opt.fit(np.arange(100), np.arange(100))
         self.assertIsInstance(opt.best_estimator_, NegatedBranin)
+        self.assertIsInstance(opt.cv_results_, dict)
+        self.assertIsInstance(opt.best_params_, dict)
+
+    def test_sigopt_optimizer(self):
+        # the SigOpt starter plan does not really support cross validation, so we provide a separated validation set
+        opt = SigOptOptimizer(estimator=NegatedBranin(),
+                              params=[Parameter('a', Parameter.DOUBLE, min_bound=-5.0, max_bound=10.0),
+                                      Parameter('b', Parameter.DOUBLE, min_bound=0.0, max_bound=15.0)],
+                              max_trials=20, api_token='DGBEFWWHKGYOUOYBMECDGBJAGNIXFVFBWEXHPLCNPXTFYHXC',
+                              cv=(np.arange(10), np.arange(10)))
+        opt.fit(np.arange(100), np.arange(100))
+        self.assertIsInstance(opt.best_estimator_, NegatedBranin)
+        self.assertIsInstance(opt.cv_results_, dict)
+        self.assertIsInstance(opt.best_params_, dict)
+
+    def test_spearmint_optimizer(self):
+        opt = SpearmintOptimizer(estimator=NegatedBranin(),
+                                 params=[Parameter('a', Parameter.DOUBLE, min_bound=-5.0, max_bound=10.0),
+                                         Parameter('b', Parameter.DOUBLE, min_bound=0.0, max_bound=15.0)],
+                                 max_trials=20, cv=(np.arange(10), np.arange(10)))
+        opt.fit(np.arange(100), np.arange(100))
+        # self.assertIsInstance(opt.best_estimator_, NegatedBranin)
         self.assertIsInstance(opt.cv_results_, dict)
         self.assertIsInstance(opt.best_params_, dict)
 

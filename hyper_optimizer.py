@@ -2,14 +2,21 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import copy
+import importlib
+import os
+import sys
+import tempfile
+import time
 from collections import OrderedDict
-
+import inspect
 import numpy as np
-import sigopt
 from scipy import stats
+from sigopt_sklearn.search import SigOptSearchCV
 from sklearn.base import BaseEstimator
-from sklearn.model_selection import RandomizedSearchCV
-from sklearn.model_selection import ShuffleSplit
+from sklearn.model_selection import RandomizedSearchCV, ShuffleSplit
+from spearmint import main as spearmint_main
+from spearmint.resources.resource import parse_resources_from_config, print_resources_status
+from spearmint.utils.database.mongodb import MongoDB
 
 
 def _require(condition, msg):
@@ -129,8 +136,13 @@ class History(object):
                 results['mean_{}'.format(k)].append(np.mean(getattr(entry, '{}s'.format(k))))
                 results['std_{}'.format(k)].append(np.std(getattr(entry, '{}s'.format(k))))
             results['params'].append(entry.params)
-        ls = results['mean_test_score']
-        results['rank_test_score'] = (len(ls) - np.argsort(ls)).tolist()
+        arg_sorted = np.argsort(results['mean_test_score'])
+
+        ls = [0] * len(arg_sorted)
+        for i, v in enumerate(arg_sorted):
+            ls[v] = i + 1
+        results['rank_test_score'] = ls
+
         return results
 
     @property
@@ -152,7 +164,7 @@ class History(object):
 
 class Optimizer(object):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
-                 refit=True, expr_name='unnamed', verbose=0, random_state=None, error_score='raise'):
+                 refit=True, verbose=0, random_state=None, error_score='raise'):
         """
 
         :param estimator: an object of class :ref:`HyperBaseEstimator`
@@ -164,7 +176,6 @@ class Optimizer(object):
             - tuple (X, y=None): use this separated validation set instead
 
         :param refit: Refit the best estimator with the entire dataset
-        :param expr_name:
         :param verbose: Controls the verbosity: the higher, the more messages.
         :param random_state: int, pseudo random number generator state used for random uniform
         :param error_score: Value to assign to the score if an error occurs in estimator fitting.
@@ -177,7 +188,6 @@ class Optimizer(object):
         self.max_trials = max_trials
         self.cv = cv
         self.refit = refit
-        self.expr_name = expr_name
         self.verbose = verbose
         self.random_state = random_state
         self.error_score = error_score
@@ -206,42 +216,43 @@ class Optimizer(object):
     Helpers
     """
 
-    def _check_cv(self):
+    def _check_cv(self, X, y=None, extract_to_list=False):
         """
         Return a wrapped object for cross-validation
         """
         if self.cv is None:
             self.cv = ShuffleSplit(n_splits=3, test_size=0.1, random_state=self.random_state)
 
+        cv_obj = self.cv
         if isinstance(self.cv, tuple):
             _require(len(self.cv) == 2, 'If you pass a tuple to "cv", it has to be a 2-tuple, containing (X, y)')
-
-
-class RandomOptimizer(Optimizer):
-    def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
-                 refit=True, expr_name='unnamed', verbose=0, n_jobs=1):
-        """
-
-        :param n_jobs: number of jobs running in parallel
-        """
-        super(RandomOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
-                                              cv=cv, refit=refit, expr_name=expr_name, verbose=verbose)
-        self.n_jobs = n_jobs
-        self.optimizer = None
-
-    def fit(self, X, y=None):
-        self._check_cv()
-
-        if isinstance(self.cv, tuple):
             n_train = X.shape[0]
             X = np.concatenate((X, self.cv[0]), axis=0)
             if y is not None:
                 y = np.concatenate((y, self.cv[1]), axis=0)
 
             cv_obj = [(np.arange(0, n_train), np.arange(n_train, X.shape[0]))]
-        else:
-            cv_obj = self.cv
+        elif extract_to_list:
+            cv_obj = list(cv_obj.split(X))
 
+        return X, y, cv_obj
+
+
+class RandomOptimizer(Optimizer):
+    def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
+                 refit=True, verbose=0, random_state=None, error_score='raise', n_jobs=1):
+        """
+
+        :param n_jobs: number of jobs running in parallel
+        """
+        super(RandomOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
+                                              cv=cv, refit=refit, verbose=verbose, random_state=random_state,
+                                              error_score=error_score)
+        self.n_jobs = n_jobs
+        self.optimizer = None
+
+    def fit(self, X, y=None):
+        X, y, cv_obj = self._check_cv(X, y)
         self.optimizer = RandomizedSearchCV(estimator=self.estimator, param_distributions=self._parse_params(),
                                             n_iter=self.max_trials, n_jobs=self.n_jobs, refit=self.refit,
                                             cv=cv_obj, verbose=self.verbose, random_state=self.random_state,
@@ -292,27 +303,235 @@ class RandomOptimizer(Optimizer):
         return params
 
 
-class SpearmintOptimizer(Optimizer):
-    pass
-
-
 class SigOptOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
-                 refit=True, expr_name='unnamed', verbose=0, api_token='', n_jobs=1):
+                 refit=True, verbose=0, random_state=None, error_score='raise', api_token='', n_jobs=1):
+        """
+
+        :param estimator:
+        :param params:
+        :param max_trials:
+        :param cv:
+        :param refit:
+        :param verbose:
+        :param api_token:
+        :param n_jobs:
+        """
         super(SigOptOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
-                                              cv=cv, refit=refit, expr_name=expr_name, verbose=verbose)
-        self.conn = sigopt.Connection(client_token=api_token)
+                                              cv=cv, refit=refit, verbose=verbose,
+                                              random_state=random_state, error_score=error_score)
+        self.api_token = api_token
         self.n_jobs = n_jobs
+        self.optimizer = None
 
     def fit(self, X, y=None):
-        experiment = self.conn.experiments().create(
-            name=self.expr_name,
-            parameters=[
-                dict(name='x', type='double', bounds=dict(min=0.0, max=1.0)),
-                dict(name='y', type='double', bounds=dict(min=0.0, max=1.0)),
-            ],
-        )
+        X, y, cv_obj = self._check_cv(X, y, extract_to_list=True)
+        self.optimizer = SigOptSearchCV(estimator=self.estimator, param_domains=self._parse_params(),
+                                        n_iter=self.max_trials, n_jobs=self.n_jobs, refit=self.refit,
+                                        cv=cv_obj, verbose=self.verbose, error_score=self.error_score,
+                                        client_token=self.api_token)
+        self.optimizer.fit(X=X, y=y)
+
+        for obs in self.optimizer.sigopt_connection.experiments(
+                self.optimizer.experiment.id).observations().fetch().iterate_pages():
+            entry = HistoryEntry(train_scores=[np.nan], test_scores=[obs.value],
+                                 fit_times=[np.nan], score_times=[np.nan], params=obs.assignments.to_json())
+            self.history_.append(entry)
+
+    @property
+    def best_estimator_(self):
+        return self.optimizer.best_estimator_
+
+    def _parse_params(self):
+        params = {}
+        for p in self.params:
+            if p.param_type == Parameter.CATEGORICAL:
+                vals = p.values[:]
+            elif p.param_type == Parameter.SCIKIT_DISTRIBUTION:
+                raise ValueError('Parameter {} of type {} is not supported by {}'.format(
+                    p.name, p.param_type, self.__class__.__name__))
+            else:
+                cast_func = float if p.param_type == Parameter.DOUBLE else int
+                vals = (cast_func(p.min_bound), cast_func(p.max_bound))
+            params[p.name] = vals
+        return params
+
+
+class SpearmintOptimizer(Optimizer):
+    def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
+                 refit=True, verbose=0, random_state=None, error_score='raise',
+                 noisy_likelihood=True, db_address='localhost', expr_name='unnamed'):
+        if not inspect.isclass(estimator):
+            estimator = estimator.__class__
+        super(SpearmintOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
+                                                 cv=cv, refit=refit, verbose=verbose,
+                                                 random_state=random_state, error_score=error_score)
+        self.noisy_likelihood = noisy_likelihood
+        self.db_address = db_address
+        self.expr_name = expr_name
+
+    def fit(self, X, y=None):
+
+        script_file = 'branin_noisy.py'
+        options = {'chooser': 'default_chooser',
+                   'language': 'PYTHON',
+                   'main-file': script_file,
+                   'experiment-name': self.expr_name,
+                   'tasks': {'main': {'type': 'OBJECTIVE',
+                                      'likelihood': 'GAUSSIAN' if self.noisy_likelihood else 'NOISELESS'}},
+                   'database': {'name': 'spearmint', 'address': self.db_address},
+                   'variables': self._parse_params()}
+        expt_dir = tempfile.mkdtemp(prefix='hyper_optimizer', suffix=self.expr_name)
+
+        print('Experiment directory: {}'.format(expt_dir))
+
+        # bump data and cv to a file in expt_dir
+        X, y, cv_obj_list = self._check_cv(X, y, extract_to_list=True)
+        with open(os.path.join(expt_dir, 'data.npz'), 'wb') as f:
+            np.savez(f, X=X, y=y, cv=cv_obj_list)
+
+        # create the main script, write it to script_file
+        with open(os.path.join(expt_dir, script_file), 'w') as f:
+            f.write(self._create_script())
+
+        resources = parse_resources_from_config(options)
+        # Load up the chooser.
+        chooser_module = importlib.import_module('spearmint.choosers.' + options['chooser'])
+        chooser = chooser_module.init(options)
+        experiment_name = options.get("experiment-name", 'unnamed-experiment')
+
+        # Connect to the database
+        db_address = options['database']['address']
+        sys.stderr.write('Using database at %s.\n' % db_address)
+        db = MongoDB(database_address=db_address)
+
+        while True:
+
+            for resource_name, resource in resources.iteritems():
+
+                jobs = spearmint_main.load_jobs(db, experiment_name)
+                # resource.printStatus(jobs)
+
+                # If the resource is currently accepting more jobs
+                # TODO: here cost will eventually also be considered: even if the
+                #       resource is not full, we might wait because of cost incurred
+                # Note: I chose to fill up one resource and them move on to the next
+                # You could also do it the other way, by changing "while" to "if" here
+
+                while resource.acceptingJobs(jobs):
+
+                    # Load jobs from DB
+                    # (move out of one or both loops?) would need to pass into load_tasks
+                    jobs = spearmint_main.load_jobs(db, experiment_name)
+
+                    # Remove any broken jobs from pending.
+                    spearmint_main.remove_broken_jobs(db, jobs, experiment_name, resources)
+
+                    # Get a suggestion for the next job
+                    suggested_job = spearmint_main.get_suggestion(chooser, resource.tasks, db,
+                                                                  expt_dir, options, resource_name)
+
+                    # Submit the job to the appropriate resource
+                    process_id = resource.attemptDispatch(experiment_name, suggested_job, db_address, expt_dir)
+
+                    # Set the status of the job appropriately (successfully submitted or not)
+                    if process_id is None:
+                        suggested_job['status'] = 'broken'
+                        spearmint_main.save_job(suggested_job, db, experiment_name)
+                    else:
+                        suggested_job['status'] = 'pending'
+                        suggested_job['proc_id'] = process_id
+                        spearmint_main.save_job(suggested_job, db, experiment_name)
+
+                    jobs = spearmint_main.load_jobs(db, experiment_name)
+
+                    # Print out the status of the resources
+                    # resource.printStatus(jobs)
+                    print_resources_status(resources.values(), jobs)
+
+            # If no resources are accepting jobs, sleep
+            # (they might be accepting if suggest takes a while and so some jobs already
+            # finished by the time this point is reached)
+            if spearmint_main.tired(db, experiment_name, resources):
+                time.sleep(options.get('polling-time', 5))
+
+        # TODO: read the results
 
     @property
     def best_estimator_(self):
         pass
+
+    def _parse_params(self):
+        params = {}
+        for p in self.params:
+            if p.param_type == Parameter.CATEGORICAL:
+                vals = {'type': 'ENUM',
+                        'size': 1,
+                        'options': p.values[:]}
+            elif p.param_type == Parameter.SCIKIT_DISTRIBUTION:
+                raise ValueError('Parameter {} of type {} is not supported by {}'.format(
+                    p.name, p.param_type, self.__class__.__name__))
+            else:
+                cast_func = float if p.param_type == Parameter.DOUBLE else int
+                vals = {'type': 'FLOAT' if p.param_type == Parameter.DOUBLE else 'INT',
+                        'size': 1,
+                        'min': cast_func(p.min_bound),
+                        'max': cast_func(p.max_bound)}
+            params[p.name] = vals
+        return params
+
+    def _create_script(self):
+
+        return """import os
+import time
+import numpy as np
+import json
+from hyper_optimizer import HyperBaseEstimator
+
+
+%s
+
+
+def main(job_id, params):
+
+    for k in params.keys():
+        v = params[k]
+        if v.shape == (1,):
+            params[k] = v[0]
+
+    # load dataset
+    current_folder = os.path.split(__file__)[0]
+    with open(os.path.join(current_folder, 'data.npz')) as f:
+        data = np.load(f)
+        X, y, cv = data['X'], data['y'], data['cv'].tolist()
+        if len(y.shape) == 0:
+            y = None
+
+    result_dir = os.path.join(current_folder, 'results')
+    os.makedirs(result_dir, exist_ok=True)
+
+    stats = {'test_scores': [],
+             'fit_times': [],
+             'score_times': [],
+             'params': params}
+
+    for train_idx, test_idx in cv:
+        x_split, y_split = X[train_idx], None if y is None else y[train_idx]
+        x_test_split, y_test_split = X[test_idx], None if y is None else y[test_idx]
+
+        obj = %s(**params)
+        t = time.time()
+        obj.fit(X=x_split, y=y_split)
+        stats['fit_times'].append(time.time() - t)
+        t = time.time()
+        test_score = obj.score(X=x_test_split, y=y_test_split)
+        stats['score_times'].append(time.time() - t)
+        stats['test_scores'].append(test_score)
+
+    stats['train_scores'] = [np.nan] * len(stats['test_scores'])
+    with open(os.path.join(result_dir, '{}.json'.format(job_id))) as f:
+        json.dump(stats, f)
+
+    return np.mean(stats['test_scores'])
+
+        """ % (inspect.getsource(self.estimator), self.estimator.__name__)
