@@ -2,13 +2,16 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import copy
+import glob
 import importlib
+import inspect
+import json
 import os
 import sys
 import tempfile
 import time
 from collections import OrderedDict
-import inspect
+
 import numpy as np
 from scipy import stats
 from sigopt_sklearn.search import SigOptSearchCV
@@ -360,7 +363,7 @@ class SigOptOptimizer(Optimizer):
 class SpearmintOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
                  refit=True, verbose=0, random_state=None, error_score='raise',
-                 noisy_likelihood=True, db_address='localhost', expr_name='unnamed'):
+                 noisy_likelihood=True, db_address='localhost', expr_name='unnamed', overwrite_expr=True):
         if not inspect.isclass(estimator):
             estimator = estimator.__class__
         super(SpearmintOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
@@ -369,6 +372,8 @@ class SpearmintOptimizer(Optimizer):
         self.noisy_likelihood = noisy_likelihood
         self.db_address = db_address
         self.expr_name = expr_name
+        self.overwrite_expr = overwrite_expr
+        self._best_estimator_ = None
 
     def fit(self, X, y=None):
 
@@ -386,9 +391,9 @@ class SpearmintOptimizer(Optimizer):
         print('Experiment directory: {}'.format(expt_dir))
 
         # bump data and cv to a file in expt_dir
-        X, y, cv_obj_list = self._check_cv(X, y, extract_to_list=True)
+        X_all, y_all, cv_obj_list = self._check_cv(X, y, extract_to_list=True)
         with open(os.path.join(expt_dir, 'data.npz'), 'wb') as f:
-            np.savez(f, X=X, y=y, cv=cv_obj_list)
+            np.savez(f, X=X_all, y=y_all, cv=cv_obj_list)
 
         # create the main script, write it to script_file
         with open(os.path.join(expt_dir, script_file), 'w') as f:
@@ -405,9 +410,12 @@ class SpearmintOptimizer(Optimizer):
         sys.stderr.write('Using database at %s.\n' % db_address)
         db = MongoDB(database_address=db_address)
 
-        while True:
+        if self.overwrite_expr:
+            db.remove(experiment_name, 'jobs')
 
-            for resource_name, resource in resources.iteritems():
+        for trial in range(self.max_trials):
+
+            for resource_name, resource in resources.items():
 
                 jobs = spearmint_main.load_jobs(db, experiment_name)
                 # resource.printStatus(jobs)
@@ -455,11 +463,23 @@ class SpearmintOptimizer(Optimizer):
             if spearmint_main.tired(db, experiment_name, resources):
                 time.sleep(options.get('polling-time', 5))
 
-        # TODO: read the results
+        for result_file in sorted(glob.glob(os.path.join(expt_dir, 'results/*.json'))):
+            with open(result_file, 'r') as f:
+                result = json.load(f)
+            entry = HistoryEntry(train_scores=result['train_scores'],
+                                 test_scores=result['test_scores'],
+                                 fit_times=result['fit_times'],
+                                 score_times=result['score_times'],
+                                 params=result['params'])
+            self.history_.append(entry)
+
+        if self.refit:
+            self._best_estimator_ = self.estimator(**self.best_params_)
+            self._best_estimator_.fit(X=X, y=y)
 
     @property
     def best_estimator_(self):
-        pass
+        return self._best_estimator_
 
     def _parse_params(self):
         params = {}
@@ -486,14 +506,16 @@ class SpearmintOptimizer(Optimizer):
 import time
 import numpy as np
 import json
-from hyper_optimizer import HyperBaseEstimator
 
+from sklearn.base import BaseEstimator
 
 %s
 
+%s
 
 def main(job_id, params):
-
+    print(job_id, params)
+    
     for k in params.keys():
         v = params[k]
         if v.shape == (1,):
@@ -501,7 +523,7 @@ def main(job_id, params):
 
     # load dataset
     current_folder = os.path.split(__file__)[0]
-    with open(os.path.join(current_folder, 'data.npz')) as f:
+    with open(os.path.join(current_folder, 'data.npz'), 'rb') as f:
         data = np.load(f)
         X, y, cv = data['X'], data['y'], data['cv'].tolist()
         if len(y.shape) == 0:
@@ -529,9 +551,10 @@ def main(job_id, params):
         stats['test_scores'].append(test_score)
 
     stats['train_scores'] = [np.nan] * len(stats['test_scores'])
-    with open(os.path.join(result_dir, '{}.json'.format(job_id))) as f:
+    with open(os.path.join(result_dir, '{:09d}.json'.format(job_id)), 'w') as f:
         json.dump(stats, f)
 
-    return np.mean(stats['test_scores'])
+    # returns the negative score because spearmint minimizes the objective function
+    return -np.mean(stats['test_scores'])
 
-        """ % (inspect.getsource(self.estimator), self.estimator.__name__)
+        """ % (inspect.getsource(HyperBaseEstimator), inspect.getsource(self.estimator), self.estimator.__name__)
