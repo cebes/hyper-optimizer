@@ -13,6 +13,8 @@ import time
 from collections import OrderedDict
 
 import numpy as np
+import six
+from bayes_opt import BayesianOptimization
 from scipy import stats
 from sigopt_sklearn.search import SigOptSearchCV
 from sklearn.base import BaseEstimator
@@ -45,7 +47,6 @@ class Parameter(object):
         :param distribution: a random distribution to take values from, typically from ``scipy.stats.distributions``.
             Only matter if ``param_type=SCIKIT_DISTRIBUTION``
         """
-        _require(name not in ['X', 'y'], 'Parameter named {} is forbidden'.format(name))
 
         self.name = name
         self.param_type = param_type
@@ -86,6 +87,7 @@ class HyperBaseEstimator(BaseEstimator):
         raise NotImplementedError()
 
 
+@six.python_2_unicode_compatible
 class HistoryEntry(object):
     def __init__(self, train_scores=(), test_scores=(), fit_times=(), score_times=(), params=None):
         _require(len(train_scores) == len(test_scores) == len(fit_times) == len(score_times),
@@ -97,11 +99,33 @@ class HistoryEntry(object):
         self.params = params
         self.n_splits = len(train_scores)
 
+    def __repr__(self):
+        return '{}(params={},test_scores={})'.format(self.__class__.__name__, self.params, self.test_scores)
+
 
 class History(object):
     def __init__(self):
         self.entries = []
         self.n_splits = None
+
+    def __repr__(self):
+        return '{}(entries={})'.format(self.__class__.__name__, self.entries)
+
+    @property
+    def best_entry_(self):
+        best_entry = None
+        for entry in self.entries:
+            if best_entry is None or np.mean(best_entry.test_scores) < np.mean(entry.test_scores):
+                best_entry = entry
+        return best_entry
+
+    @property
+    def best_test_score_(self):
+        return np.mean(self.best_entry_.test_scores)
+
+    @property
+    def best_params_(self):
+        return copy.deepcopy(self.best_entry_.params)
 
     def append(self, entry):
         """
@@ -148,21 +172,38 @@ class History(object):
 
         return results
 
-    @property
-    def best_entry_(self):
-        best_entry = None
-        for entry in self.entries:
-            if best_entry is None or np.mean(best_entry.test_scores) < np.mean(entry.test_scores):
-                best_entry = entry
-        return best_entry
+    def plot(self, style='seaborn-dark-palette', figsize=(20, 10), **fig_kw):
+        import matplotlib.pyplot as plt
 
-    @property
-    def best_test_score_(self):
-        return np.mean(self.best_entry_.test_scores)
+        plt.style.use(style)
+        fig, axs = plt.subplots(2, 1, sharex='all', figsize=figsize, **fig_kw)
 
-    @property
-    def best_params_(self):
-        return copy.deepcopy(self.best_entry_.params)
+        x = range(len(self.entries))
+        avg_train_score = [np.mean(e.train_scores) for e in self.entries]
+        avg_train_score = [np.max(avg_train_score[:i+1]) for i in range(len(avg_train_score))]
+        avg_test_score = [np.mean(e.test_scores) for e in self.entries]
+        avg_test_score = [np.max(avg_test_score[:i + 1]) for i in range(len(avg_test_score))]
+        axs[0].plot(x, avg_train_score, label='Best average training score', linewidth=2)
+        axs[0].plot(x, avg_test_score, label='Best average test score', linewidth=2)
+        axs[0].set_title('Average train and test scores across folds')
+        axs[0].set_xlabel('Trial')
+        axs[0].set_ylabel('Score')
+        axs[0].grid(which='major', alpha=0.5)
+        axs[0].legend()
+
+        avg_fit_time = [np.mean(e.fit_times) for e in self.entries]
+        std_fit_time = [np.std(e.fit_times) for e in self.entries]
+        avg_score_time = [np.mean(e.score_times) for e in self.entries]
+        std_score_time = [np.std(e.score_times) for e in self.entries]
+        axs[1].errorbar(x, avg_fit_time, yerr=std_fit_time, label='Average training time', linewidth=2)
+        axs[1].errorbar(x, avg_score_time, yerr=std_score_time, label='Average scoring time', linewidth=2)
+        axs[1].set_xlabel('Trial')
+        axs[1].set_ylabel('Time (seconds)')
+        axs[1].set_xticks(x)
+        axs[1].grid(which='major', alpha=0.5)
+        axs[1].legend()
+
+        return fig
 
 
 class Optimizer(object):
@@ -360,19 +401,91 @@ class SigOptOptimizer(Optimizer):
         return params
 
 
-class SpearmintOptimizer(Optimizer):
+class BayesOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
-                 refit=True, verbose=0, random_state=None, error_score='raise',
-                 noisy_likelihood=True, db_address='localhost', expr_name='unnamed', overwrite_expr=True):
+                 refit=True, verbose=0, random_state=None, error_score='raise', acquisition_func='ucb'):
+        if not inspect.isclass(estimator):
+            estimator = estimator.__class__
+
+        super(BayesOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
+                                             cv=cv, refit=refit, verbose=verbose, random_state=random_state,
+                                             error_score=error_score)
+        self.acquisition_func = acquisition_func
+        self.optimizer_ = None
+        self._x_all = None
+        self._y_all = None
+        self._cv_obj = None
+        self.history_ = History()
+        self._best_estimator_ = None
+
+    @property
+    def best_estimator_(self):
+        return self._best_estimator_
+
+    def fit(self, X, y=None):
+        self._x_all, self._y_all, self._cv_obj = self._check_cv(X, y, extract_to_list=True)
+        self.history_ = History()
+
+        self.optimizer_ = BayesianOptimization(self._objective_func, pbounds=self._parse_params(), verbose=self.verbose)
+        self.optimizer_.maximize(n_iter=self.max_trials, acq=self.acquisition_func)
+
+        if self.refit:
+            self._best_estimator_ = self.estimator(**self.best_params_)
+            self._best_estimator_.fit(X=X, y=y)
+
+    def _objective_func(self, **kwargs):
+        estimator = self.estimator(**kwargs)
+
+        entry = HistoryEntry(train_scores=[], test_scores=[], fit_times=[], score_times=[], params=kwargs)
+        for train_idx, test_idx in self._cv_obj:
+            x_split, y_split = self._x_all[train_idx], None if self._y_all is None else self._y_all[train_idx]
+            x_test_split, y_test_split = self._x_all[test_idx], None if self._y_all is None else self._y_all[test_idx]
+
+            t = time.time()
+            estimator.fit(X=x_split, y=y_split)
+            entry.fit_times.append(time.time() - t)
+            t = time.time()
+            test_score = estimator.score(X=x_test_split, y=y_test_split)
+            entry.score_times.append(time.time() - t)
+            entry.test_scores.append(test_score)
+            entry.train_scores.append(np.nan)
+
+        self.history_.append(entry)
+        return np.mean(entry.test_scores)
+
+    def _parse_params(self):
+        params = {}
+        for p in self.params:
+            if p.param_type == Parameter.CATEGORICAL or p.param_type == Parameter.SCIKIT_DISTRIBUTION:
+                raise ValueError('Parameter {} of type {} is not supported by {}'.format(
+                    p.name, p.param_type, self.__class__.__name__))
+            else:
+                cast_func = float if p.param_type == Parameter.DOUBLE else int
+                vals = (cast_func(p.min_bound), cast_func(p.max_bound))
+            params[p.name] = vals
+        return params
+
+
+"""
+Spearmint optimizer
+"""
+
+
+class SpearmintOptimizer(Optimizer):
+    def __init__(self, estimator=None, params=None, max_trials=40, cv=None, refit=True, verbose=0,
+                 noisy_likelihood=True, db_address='localhost', expr_name='unnamed', overwrite_expr=True,
+                 polling_time=0, n_jobs=1):
         if not inspect.isclass(estimator):
             estimator = estimator.__class__
         super(SpearmintOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
                                                  cv=cv, refit=refit, verbose=verbose,
-                                                 random_state=random_state, error_score=error_score)
+                                                 random_state=None, error_score='raise')
         self.noisy_likelihood = noisy_likelihood
         self.db_address = db_address
         self.expr_name = expr_name
         self.overwrite_expr = overwrite_expr
+        self.polling_time = polling_time
+        self.n_jobs = n_jobs
         self._best_estimator_ = None
 
     def fit(self, X, y=None):
@@ -385,7 +498,8 @@ class SpearmintOptimizer(Optimizer):
                    'tasks': {'main': {'type': 'OBJECTIVE',
                                       'likelihood': 'GAUSSIAN' if self.noisy_likelihood else 'NOISELESS'}},
                    'database': {'name': 'spearmint', 'address': self.db_address},
-                   'variables': self._parse_params()}
+                   'variables': self._parse_params(),
+                   'max-concurrent': self.n_jobs}
         expt_dir = tempfile.mkdtemp(prefix='hyper_optimizer', suffix=self.expr_name)
 
         print('Experiment directory: {}'.format(expt_dir))
@@ -413,27 +527,32 @@ class SpearmintOptimizer(Optimizer):
         if self.overwrite_expr:
             db.remove(experiment_name, 'jobs')
 
-        for trial in range(self.max_trials):
+        while True:
+
+            # clean up
+            jobs = spearmint_main.load_jobs(db, experiment_name)
+            for job in jobs:
+                if job['status'] == 'pending':
+                    if not resources[job['resource']].isJobAlive(job):
+                        job['status'] = 'broken'
+                        spearmint_main.save_job(job, db, experiment_name)
+                        # always raise if job is broken
+                        raise ValueError('Broken job {} detected. Experiment folder: {}'.format(job['id'], expt_dir))
+
+            # break if more than max_trials jobs have been completed
+            trials = sum(job['status'] == 'complete' for job in jobs)
+            if trials >= self.max_trials:
+                break
 
             for resource_name, resource in resources.items():
 
                 jobs = spearmint_main.load_jobs(db, experiment_name)
-                # resource.printStatus(jobs)
-
-                # If the resource is currently accepting more jobs
-                # TODO: here cost will eventually also be considered: even if the
-                #       resource is not full, we might wait because of cost incurred
-                # Note: I chose to fill up one resource and them move on to the next
-                # You could also do it the other way, by changing "while" to "if" here
 
                 while resource.acceptingJobs(jobs):
 
                     # Load jobs from DB
                     # (move out of one or both loops?) would need to pass into load_tasks
                     jobs = spearmint_main.load_jobs(db, experiment_name)
-
-                    # Remove any broken jobs from pending.
-                    spearmint_main.remove_broken_jobs(db, jobs, experiment_name, resources)
 
                     # Get a suggestion for the next job
                     suggested_job = spearmint_main.get_suggestion(chooser, resource.tasks, db,
@@ -446,22 +565,23 @@ class SpearmintOptimizer(Optimizer):
                     if process_id is None:
                         suggested_job['status'] = 'broken'
                         spearmint_main.save_job(suggested_job, db, experiment_name)
+                        raise ValueError('Failed to dispatch job {}. Experiment folder: {}'.format(
+                            suggested_job['id'], expt_dir))
                     else:
                         suggested_job['status'] = 'pending'
                         suggested_job['proc_id'] = process_id
                         spearmint_main.save_job(suggested_job, db, experiment_name)
 
-                    jobs = spearmint_main.load_jobs(db, experiment_name)
-
                     # Print out the status of the resources
-                    # resource.printStatus(jobs)
-                    print_resources_status(resources.values(), jobs)
+                    if self.verbose > 0:
+                        jobs = spearmint_main.load_jobs(db, experiment_name)
+                        print_resources_status(resources.values(), jobs)
 
             # If no resources are accepting jobs, sleep
             # (they might be accepting if suggest takes a while and so some jobs already
             # finished by the time this point is reached)
             if spearmint_main.tired(db, experiment_name, resources):
-                time.sleep(options.get('polling-time', 5))
+                time.sleep(self.polling_time)
 
         for result_file in sorted(glob.glob(os.path.join(expt_dir, 'results/*.json'))):
             with open(result_file, 'r') as f:
@@ -472,6 +592,9 @@ class SpearmintOptimizer(Optimizer):
                                  score_times=result['score_times'],
                                  params=result['params'])
             self.history_.append(entry)
+
+        if self.verbose > 0:
+            print('Done. Experiment folder: {}'.format(expt_dir))
 
         if self.refit:
             self._best_estimator_ = self.estimator(**self.best_params_)

@@ -6,3 +6,7 @@ scikit-learn
 sigopt
 sigopt_sklearn
 pymongo
+git+https://github.com/phvu/Spearmint.git@master
+bayesian-optimization
+six
+matplotlib
