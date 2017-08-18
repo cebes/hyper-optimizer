@@ -674,7 +674,7 @@ def main(job_id, params):
             if len(v) == 1:
                 params[k] = v[0]
         elif v.shape == (1,):
-            params[k] = v[0]
+            params[k] = np.asscalar(v[0])
 
     # load dataset
     current_folder = os.path.split(__file__)[0]
