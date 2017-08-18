@@ -404,6 +404,19 @@ class SigOptOptimizer(Optimizer):
 class BayesOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
                  refit=True, verbose=0, random_state=None, error_score='raise', acquisition_func='ucb'):
+        """
+        Does not support categorical and integer variables
+
+        :param estimator:
+        :param params:
+        :param max_trials:
+        :param cv:
+        :param refit:
+        :param verbose:
+        :param random_state:
+        :param error_score:
+        :param acquisition_func:
+        """
         if not inspect.isclass(estimator):
             estimator = estimator.__class__
 
@@ -475,6 +488,22 @@ class SpearmintOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None, refit=True, verbose=0,
                  noisy_likelihood=True, db_address='localhost', expr_name='unnamed', overwrite_expr=True,
                  polling_time=0, n_jobs=1):
+        """
+        The Free plan doesn't support Categorical variables and more than 4 variables.
+
+        :param estimator:
+        :param params:
+        :param max_trials:
+        :param cv:
+        :param refit:
+        :param verbose:
+        :param noisy_likelihood:
+        :param db_address:
+        :param expr_name:
+        :param overwrite_expr:
+        :param polling_time:
+        :param n_jobs:
+        """
         if not inspect.isclass(estimator):
             estimator = estimator.__class__
         super(SpearmintOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
@@ -641,7 +670,10 @@ def main(job_id, params):
     
     for k in params.keys():
         v = params[k]
-        if v.shape == (1,):
+        if isinstance(v, list):
+            if len(v) == 1:
+                params[k] = v[0]
+        elif v.shape == (1,):
             params[k] = v[0]
 
     # load dataset
