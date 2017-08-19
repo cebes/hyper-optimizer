@@ -528,7 +528,9 @@ class SpearmintOptimizer(Optimizer):
                                       'likelihood': 'GAUSSIAN' if self.noisy_likelihood else 'NOISELESS'}},
                    'database': {'name': 'spearmint', 'address': self.db_address},
                    'variables': self._parse_params(),
-                   'max-concurrent': self.n_jobs}
+                   'max-concurrent': self.n_jobs,
+                   'max-finished-jobs': self.max_trials}
+
         expt_dir = tempfile.mkdtemp(prefix='hyper_optimizer', suffix=self.expr_name)
 
         print('Experiment directory: {}'.format(expt_dir))
@@ -556,32 +558,14 @@ class SpearmintOptimizer(Optimizer):
         if self.overwrite_expr:
             db.remove(experiment_name, 'jobs')
 
-        while True:
-
-            # clean up
-            jobs = spearmint_main.load_jobs(db, experiment_name)
-            for job in jobs:
-                if job['status'] == 'pending':
-                    if not resources[job['resource']].isJobAlive(job):
-                        job['status'] = 'broken'
-                        spearmint_main.save_job(job, db, experiment_name)
-                        # always raise if job is broken
-                        raise ValueError('Broken job {} detected. Experiment folder: {}'.format(job['id'], expt_dir))
-
-            # break if more than max_trials jobs have been completed
-            trials = sum(job['status'] == 'complete' for job in jobs)
-            if trials >= self.max_trials:
-                break
+        finished_jobs = 0
+        while finished_jobs < self.max_trials:
 
             for resource_name, resource in resources.items():
 
                 jobs = spearmint_main.load_jobs(db, experiment_name)
 
                 while resource.acceptingJobs(jobs):
-
-                    # Load jobs from DB
-                    # (move out of one or both loops?) would need to pass into load_tasks
-                    jobs = spearmint_main.load_jobs(db, experiment_name)
 
                     # Get a suggestion for the next job
                     suggested_job = spearmint_main.get_suggestion(chooser, resource.tasks, db,
@@ -602,15 +586,35 @@ class SpearmintOptimizer(Optimizer):
                         spearmint_main.save_job(suggested_job, db, experiment_name)
 
                     # Print out the status of the resources
+                    jobs = spearmint_main.load_jobs(db, experiment_name)
                     if self.verbose > 0:
-                        jobs = spearmint_main.load_jobs(db, experiment_name)
                         print_resources_status(resources.values(), jobs)
 
             # If no resources are accepting jobs, sleep
             # (they might be accepting if suggest takes a while and so some jobs already
             # finished by the time this point is reached)
-            if spearmint_main.tired(db, experiment_name, resources):
+            jobs = spearmint_main.load_jobs(db, experiment_name)
+
+            tired = True
+            for resource_name, resource in resources.items():
+                if resource.acceptingJobs(jobs):
+                    tired = False
+                    break
+            if tired:
                 time.sleep(self.polling_time)
+
+            # clean up
+            for job in jobs:
+                if job['status'] == 'pending':
+                    if not resources[job['resource']].isJobAlive(job):
+                        job['status'] = 'broken'
+                        spearmint_main.save_job(job, db, experiment_name)
+                        # always raise if job is broken
+                        raise ValueError(
+                            'Broken job {} detected. Experiment folder: {}'.format(job['id'], expt_dir))
+
+            # break if more than max_trials jobs have been completed
+            finished_jobs = sum(job['status'] == 'complete' for job in jobs)
 
         for result_file in sorted(glob.glob(os.path.join(expt_dir, 'results/*.json'))):
             with open(result_file, 'r') as f:
