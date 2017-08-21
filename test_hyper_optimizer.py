@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from hyper_optimizer import Parameter, HyperBaseEstimator, RandomOptimizer, \
+from hyper_optimizer import Parameter, HyperBaseEstimator, RandomOptimizer, SkOptOptimizer, \
     SigOptOptimizer, SpearmintOptimizer, BayesOptimizer
 
 
@@ -30,6 +30,18 @@ class TestHyperOptimizer(unittest.TestCase):
                               params=[Parameter('a', Parameter.DOUBLE, min_bound=-5, max_bound=10),
                                       Parameter('b', Parameter.DOUBLE, min_bound=0, max_bound=15)],
                               max_trials=20)
+
+        opt.fit(np.arange(100), np.arange(100))
+        self.assertIsInstance(opt.best_estimator_, NegatedBranin)
+        self.assertIsInstance(opt.cv_results_, dict)
+        self.assertIsInstance(opt.best_params_, dict)
+        print(opt.best_params_, opt.best_test_score_)
+
+    def test_skopt_optimizer(self):
+        opt = SkOptOptimizer(estimator=NegatedBranin(),
+                             params=[Parameter('a', Parameter.DOUBLE, min_bound=-5, max_bound=10),
+                                     Parameter('b', Parameter.DOUBLE, min_bound=0, max_bound=15)],
+                             max_trials=20)
 
         opt.fit(np.arange(100), np.arange(100))
         self.assertIsInstance(opt.best_estimator_, NegatedBranin)

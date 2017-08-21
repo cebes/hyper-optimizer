@@ -14,6 +14,7 @@ from collections import OrderedDict
 
 import numpy as np
 import six
+import skopt
 from bayes_opt import BayesianOptimization
 from scipy import stats
 from sigopt_sklearn.search import SigOptSearchCV
@@ -180,7 +181,7 @@ class History(object):
 
         x = range(len(self.entries))
         avg_train_score = [np.mean(e.train_scores) for e in self.entries]
-        avg_train_score = [np.max(avg_train_score[:i+1]) for i in range(len(avg_train_score))]
+        avg_train_score = [np.max(avg_train_score[:i + 1]) for i in range(len(avg_train_score))]
         avg_test_score = [np.mean(e.test_scores) for e in self.entries]
         avg_test_score = [np.max(avg_test_score[:i + 1]) for i in range(len(avg_test_score))]
         axs[0].plot(x, avg_train_score, label='Best average training score', linewidth=2)
@@ -205,6 +206,10 @@ class History(object):
 
         return fig
 
+
+############################################################################################################
+
+############################################################################################################
 
 class Optimizer(object):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
@@ -282,46 +287,54 @@ class Optimizer(object):
         return X, y, cv_obj
 
 
+############################################################################################################
+
+############################################################################################################
+
 class RandomOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
                  refit=True, verbose=0, random_state=None, error_score='raise', n_jobs=1):
         """
+        Convenient wrapper for Random search, using sklearn's RandomizedSearchCV
 
+        :param estimator: The estimator class, typically subclass of :class:`HyperBaseEstimator`
+        :type estimator: HyperBaseEstimator
+        :param params: list of :class:`Parameter` objects
+        :type params: list
+        :param max_trials: Number of parameter settings that are sampled.
+        :param cv:
+            - None: Use standard 3-fold cross validation, with 10% test set
+            - a scikit-learn object for cross-validation, i.e. ShuffleSplit or KFold
+            - tuple (X, y=None): use this separated validation set instead
+
+        :param refit: Refit the best estimator with the entire dataset
+        :param verbose: Controls the verbosity: the higher, the more messages.
+        :param random_state: int, pseudo random number generator state used for random uniform
+        :param error_score: Value to assign to the score if an error occurs in estimator fitting.
+                If set to ‘raise’, the error is raised. If a numeric value is given,
+                FitFailedWarning is raised. This parameter does not affect the refit step,
+                which will always raise the error.
         :param n_jobs: number of jobs running in parallel
         """
         super(RandomOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
                                               cv=cv, refit=refit, verbose=verbose, random_state=random_state,
                                               error_score=error_score)
         self.n_jobs = n_jobs
-        self.optimizer = None
+        self.optimizer_ = None
 
     def fit(self, X, y=None):
         X, y, cv_obj = self._check_cv(X, y)
-        self.optimizer = RandomizedSearchCV(estimator=self.estimator, param_distributions=self._parse_params(),
-                                            n_iter=self.max_trials, n_jobs=self.n_jobs, refit=self.refit,
-                                            cv=cv_obj, verbose=self.verbose, random_state=self.random_state,
-                                            error_score=self.error_score)
-        self.optimizer.fit(X=X, y=y)
-
-        for i in range(self.max_trials):
-            train_scores = []
-            test_scores = []
-            fit_times = []
-            score_times = []
-            for s in range(self.optimizer.n_splits_):
-                train_scores.append(self.optimizer.cv_results_['split{}_train_score'.format(s)][i])
-                test_scores.append(self.optimizer.cv_results_['split{}_test_score'.format(s)][i])
-                fit_times.append(self.optimizer.cv_results_['mean_fit_time'][i])
-                score_times.append(self.optimizer.cv_results_['mean_score_time'][i])
-
-            entry = HistoryEntry(train_scores=train_scores, test_scores=test_scores, fit_times=fit_times,
-                                 score_times=score_times, params=self.optimizer.cv_results_['params'][i])
-            self.history_.append(entry)
+        self.optimizer_ = RandomizedSearchCV(estimator=self.estimator, param_distributions=self._parse_params(),
+                                             n_iter=self.max_trials, n_jobs=self.n_jobs, refit=self.refit,
+                                             cv=cv_obj, verbose=self.verbose, random_state=self.random_state,
+                                             error_score=self.error_score)
+        self.optimizer_.fit(X=X, y=y)
+        self._read_stats()
 
     @property
     def best_estimator_(self):
-        _require(self.optimizer is not None, 'Call fit() before you can get the best estimator')
-        return self.optimizer.best_estimator_
+        _require(self.optimizer_ is not None, 'Call fit() before you can get the best estimator')
+        return self.optimizer_.best_estimator_
 
     def _parse_params(self):
         """Helper to parse the list of params into a dict of param for sklearn Optimizer"""
@@ -346,20 +359,109 @@ class RandomOptimizer(Optimizer):
             params[p.name] = vals
         return params
 
+    def _read_stats(self):
+        for i in range(self.max_trials):
+            train_scores = []
+            test_scores = []
+            fit_times = []
+            score_times = []
+            for s in range(self.optimizer_.n_splits_):
+                train_scores.append(self.optimizer_.cv_results_['split{}_train_score'.format(s)][i])
+                test_scores.append(self.optimizer_.cv_results_['split{}_test_score'.format(s)][i])
+                fit_times.append(self.optimizer_.cv_results_['mean_fit_time'][i])
+                score_times.append(self.optimizer_.cv_results_['mean_score_time'][i])
+
+            entry = HistoryEntry(train_scores=train_scores, test_scores=test_scores, fit_times=fit_times,
+                                 score_times=score_times, params=self.optimizer_.cv_results_['params'][i])
+            self.history_.append(entry)
+
+
+############################################################################################################
+
+############################################################################################################
+
+class SkOptOptimizer(RandomOptimizer):
+    def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
+                 refit=True, verbose=0, random_state=None, error_score='raise', n_jobs=1):
+        """
+        Convenient wrapper for Bayesian Optimization, implemented in scikit-optimize
+
+        :param estimator: The estimator class, typically subclass of :class:`HyperBaseEstimator`
+        :type estimator: HyperBaseEstimator
+        :param params: list of :class:`Parameter` objects
+        :type params: list
+        :param max_trials: Number of parameter settings that are sampled.
+        :param cv:
+            - None: Use standard 3-fold cross validation, with 10% test set
+            - a scikit-learn object for cross-validation, i.e. ShuffleSplit or KFold
+            - tuple (X, y=None): use this separated validation set instead
+
+        :param refit: Refit the best estimator with the entire dataset
+        :param verbose: Controls the verbosity: the higher, the more messages.
+        :param random_state: int, pseudo random number generator state used for random uniform
+        :param error_score: Value to assign to the score if an error occurs in estimator fitting.
+                If set to ‘raise’, the error is raised. If a numeric value is given,
+                FitFailedWarning is raised. This parameter does not affect the refit step,
+                which will always raise the error.
+        :param n_jobs: number of jobs running in parallel
+        """
+        super(SkOptOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
+                                             cv=cv, refit=refit, verbose=verbose, random_state=random_state,
+                                             error_score=error_score, n_jobs=n_jobs)
+
+    def fit(self, X, y=None):
+        X, y, cv_obj = self._check_cv(X, y)
+        self.optimizer_ = skopt.BayesSearchCV(estimator=self.estimator, search_spaces=self._parse_params(),
+                                              n_iter=self.max_trials, n_jobs=self.n_jobs, refit=self.refit,
+                                              cv=cv_obj, verbose=self.verbose, random_state=self.random_state,
+                                              error_score=self.error_score)
+        self.optimizer_.fit(X=X, y=y)
+        self._read_stats()
+
+    def _parse_params(self):
+        params = {}
+        for p in self.params:
+            if p.param_type == Parameter.CATEGORICAL:
+                vals = p.values[:]
+            elif p.param_type in [Parameter.INT, Parameter.DOUBLE]:
+                cast_func = int if p.param_type == Parameter.INT else float
+                vals = (cast_func(p.min_bound), cast_func(p.max_bound))
+            else:
+                raise ValueError('Parameter {} of type {} is not supported by {}'.format(
+                    p.name, p.param_type, self.__class__.__name__))
+            params[p.name] = vals
+        return params
+
+
+############################################################################################################
+
+############################################################################################################
 
 class SigOptOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
                  refit=True, verbose=0, random_state=None, error_score='raise', api_token='', n_jobs=1):
         """
+        Convenient wrapper for Bayesian Optimization, implemented in SigOpt
 
-        :param estimator:
-        :param params:
-        :param max_trials:
+        :param estimator: The estimator class, typically subclass of :class:`HyperBaseEstimator`
+        :type estimator: HyperBaseEstimator
+        :param params: list of :class:`Parameter` objects
+        :type params: list
+        :param max_trials: Number of parameter settings that are sampled.
         :param cv:
-        :param refit:
-        :param verbose:
-        :param api_token:
-        :param n_jobs:
+            - None: Use standard 3-fold cross validation, with 10% test set
+            - a scikit-learn object for cross-validation, i.e. ShuffleSplit or KFold
+            - tuple (X, y=None): use this separated validation set instead
+
+        :param refit: Refit the best estimator with the entire dataset
+        :param verbose: Controls the verbosity: the higher, the more messages.
+        :param random_state: int, pseudo random number generator state used for random uniform
+        :param error_score: Value to assign to the score if an error occurs in estimator fitting.
+                If set to ‘raise’, the error is raised. If a numeric value is given,
+                FitFailedWarning is raised. This parameter does not affect the refit step,
+                which will always raise the error.
+        :param api_token: API token from your SigOpt account
+        :param n_jobs: number of jobs running in parallel
         """
         super(SigOptOptimizer, self).__init__(estimator=estimator, params=params, max_trials=max_trials,
                                               cv=cv, refit=refit, verbose=verbose,
@@ -401,21 +503,34 @@ class SigOptOptimizer(Optimizer):
         return params
 
 
+############################################################################################################
+
+############################################################################################################
+
 class BayesOptimizer(Optimizer):
     def __init__(self, estimator=None, params=None, max_trials=40, cv=None,
                  refit=True, verbose=0, random_state=None, error_score='raise', acquisition_func='ucb'):
         """
-        Does not support categorical and integer variables
+        Convenient wrapper for Bayesian Optimization, implemented in https://github.com/fmfn/BayesianOptimization
 
-        :param estimator:
-        :param params:
-        :param max_trials:
+        :param estimator: The estimator class, typically subclass of :class:`HyperBaseEstimator`
+        :type estimator: HyperBaseEstimator
+        :param params: list of :class:`Parameter` objects
+        :type params: list
+        :param max_trials: Number of parameter settings that are sampled.
         :param cv:
-        :param refit:
-        :param verbose:
-        :param random_state:
-        :param error_score:
-        :param acquisition_func:
+            - None: Use standard 3-fold cross validation, with 10% test set
+            - a scikit-learn object for cross-validation, i.e. ShuffleSplit or KFold
+            - tuple (X, y=None): use this separated validation set instead
+
+        :param refit: Refit the best estimator with the entire dataset
+        :param verbose: Controls the verbosity: the higher, the more messages.
+        :param random_state: int, pseudo random number generator state used for random uniform
+        :param error_score: Value to assign to the score if an error occurs in estimator fitting.
+                If set to ‘raise’, the error is raised. If a numeric value is given,
+                FitFailedWarning is raised. This parameter does not affect the refit step,
+                which will always raise the error.
+        :param acquisition_func: Acquisition function to be used, 'ei' or 'ucb'
         """
         if not inspect.isclass(estimator):
             estimator = estimator.__class__
@@ -479,9 +594,9 @@ class BayesOptimizer(Optimizer):
         return params
 
 
-"""
-Spearmint optimizer
-"""
+############################################################################################################
+
+############################################################################################################
 
 
 class SpearmintOptimizer(Optimizer):
@@ -489,20 +604,27 @@ class SpearmintOptimizer(Optimizer):
                  noisy_likelihood=True, db_address='localhost', expr_name='unnamed', overwrite_expr=True,
                  polling_time=0, n_jobs=1):
         """
-        The Free plan doesn't support Categorical variables and more than 4 variables.
+        Convenient wrapper for Bayesian Optimization, implemented in Spearmint
 
-        :param estimator:
-        :param params:
-        :param max_trials:
+        :param estimator: The estimator class, typically subclass of :class:`HyperBaseEstimator`
+        :type estimator: HyperBaseEstimator
+        :param params: list of :class:`Parameter` objects
+        :type params: list
+        :param max_trials: Number of parameter settings that are sampled.
         :param cv:
-        :param refit:
-        :param verbose:
-        :param noisy_likelihood:
-        :param db_address:
-        :param expr_name:
-        :param overwrite_expr:
-        :param polling_time:
-        :param n_jobs:
+            - None: Use standard 3-fold cross validation, with 10% test set
+            - a scikit-learn object for cross-validation, i.e. ShuffleSplit or KFold
+            - tuple (X, y=None): use this separated validation set instead
+
+        :param refit: Refit the best estimator with the entire dataset
+        :param verbose: Controls the verbosity: the higher, the more messages.
+        :param noisy_likelihood: Whether the objective function is noisy
+        :param db_address: Address of the MongoDB instance, needed by Spearmint
+        :param expr_name: Name of this experiment
+        :param overwrite_expr: Whether to overwrite the experiment of the same name in the database.
+            If this is False, Spearmint might stuck waiting for failed/pending trials
+        :param polling_time: Wait time (in seconds) when all resources are tired.
+        :param n_jobs: Maximum number of jobs allowed to run on each resource
         """
         if not inspect.isclass(estimator):
             estimator = estimator.__class__
@@ -518,8 +640,11 @@ class SpearmintOptimizer(Optimizer):
         self._best_estimator_ = None
 
     def fit(self, X, y=None):
+        normalized_expr_name = ''.join(c for c in self.expr_name.lower() if c.isalpha())
+        if len(normalized_expr_name) == 0:
+            normalized_expr_name = 'main_script'
 
-        script_file = 'branin_noisy.py'
+        script_file = '{}.py'.format(normalized_expr_name)
         options = {'chooser': 'default_chooser',
                    'language': 'PYTHON',
                    'main-file': script_file,

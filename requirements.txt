@@ -10,3 +10,4 @@ git+https://github.com/phvu/Spearmint.git@master
 bayesian-optimization
 six
 matplotlib
+scikit-optimize
