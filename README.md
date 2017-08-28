@@ -150,3 +150,5 @@ Note that we tune 4 hyper-parameters, and the names of those hyper-parameters ar
 estimator. We do the main work in the `fit()` function,  and the `score()` function conveniently call the `predict()`
 function before computing the mean squared error. The `score()` function returns the negated mean squared error because
 the optimizers will **maximize** whatever it returns. By maximizing the negated MSE, we practically minimize the MSE.
+
+For a more serious example, see the notebook in `nyc_taxi_duration/main.ipynb`.
