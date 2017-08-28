@@ -54,7 +54,7 @@ class TestHyperOptimizer(unittest.TestCase):
         opt = SigOptOptimizer(estimator=NegatedBranin(),
                               params=[Parameter('a', Parameter.DOUBLE, min_bound=-5.0, max_bound=10.0),
                                       Parameter('b', Parameter.DOUBLE, min_bound=0.0, max_bound=15.0)],
-                              max_trials=20, api_token='DGBEFWWHKGYOUOYBMECDGBJAGNIXFVFBWEXHPLCNPXTFYHXC',
+                              max_trials=20, api_token='',
                               cv=(np.arange(10), np.arange(10)))
         opt.fit(np.arange(100), np.arange(100))
         self.assertIsInstance(opt.best_estimator_, NegatedBranin)
